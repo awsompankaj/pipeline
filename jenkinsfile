@@ -1,0 +1,154 @@
+pipeline {
+
+    agent any
+    environment {
+      BUILD_USER = ''
+      scannerHome = tool 'sonarqubeScanner'
+      DOCKER_REGISTRY_URL = 'nexus.cloud.vssi.com:8083'
+      DOCKER_REPO = 'k8sdemo/frontend-app'
+      APP_NAME = 'frontend'
+      master_pod = 'jmeter-master-1-dgv7t'
+      qg = ''
+    }
+
+    stages {
+      stage('Slack'){
+        steps{
+          script{
+              echo "Slack"
+          }
+          slackSend channel: '#cicd',
+          color: 'good',
+          message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER} \n More info at: ${env.BUILD_URL}"
+        }
+      }//stage slack
+
+
+      stage('Git') {
+        parallel {
+
+          stage('SCM Checkout') {
+            steps {
+              script {
+                echo "Fetching source code"
+              }
+            }
+          }// stage scm
+
+          stage('Static Code Analysis') {
+            steps{
+              script{
+                nodejs('node') {
+                  withSonarQubeEnv(credentialsId: 'sonar') {
+                    sh "${scannerHome}/bin/sonar-scanner"
+                  }
+                }// node close
+                qg = waitForQualityGate()
+
+                if(qg.status != 'OK') {
+                  //error “Quality Gate failure: ${qg.status}”
+                  //echo "fail"
+                  slackSend channel: '#cicd',
+                  color: '#F01717',
+                  message: "ERROR Job ${env.JOB_NAME} Code coverage threshold Please review in sonarqube project"
+                }//if condition
+
+              }//script
+            }//steps
+          }//stage SAST
+
+        }//par
+      }//git close
+
+
+      stage('Automation Test') {
+        parallel{
+          stage('Unit Test') {
+            steps{
+                script{
+                    echo "Testing"
+                }
+            }
+          }//unit test
+
+          stage('Security Vulnerability Scan') {
+            steps{
+                script{
+                  snykSecurity failOnIssues: false, projectName: 'cloud-app', snykInstallation: 'snyk', snykTokenId: 'snyk'
+
+                }
+            }
+          }//scan
+
+        }//par
+      }//stage test
+
+      stage('Image Build and Push to Nexus ') {
+         agent {
+                kubernetes {
+                  label 'kanikobuild'
+                  defaultContainer 'kaniko'
+                  yaml """
+            apiVersion: v1
+            kind: Pod
+            metadata:
+              name: kaniko
+            spec:
+              containers:
+              - env:
+                - name: DOCKER_REPO
+                  value: ${DOCKER_REPO}
+                - name: BUILD_NUMBER
+                  value: ${env.BUILD_NUMBER}
+                name: kaniko
+                image: gcr.io/kaniko-project/executor:debug-539ddefcae3fd6b411a95982a830d987f4214251
+                imagePullPolicy: Always
+                command:
+                - cat
+                tty: true
+                volumeMounts:
+                  - name: docker-config
+                    mountPath: /kaniko/.docker
+              serviceAccount: jenkin-sa
+              securityContext:
+                runAsUser: 0
+                privileged: true
+              volumes:
+                - name: docker-config
+                  configMap:
+                    name: docker-config
+            """
+                }
+              }
+        steps {
+          container('kaniko') {
+             script{
+                        git credentialsId: 'gitlab', url: 'http://git.cloud.vssi.com/arif/test-app.git'
+
+                        sh '''
+                        /kaniko/executor --dockerfile `pwd`/Dockerfile --context `pwd` --insecure --cache=true --skip-tls-verify --destination=nexus.cloud.vssi.com:8083/${DOCKER_REPO}:${BUILD_NUMBER}
+                        '''
+                    }
+          }
+        }
+      }//stage
+
+
+
+
+     stage('Anchore Container Security') {
+        steps {
+          script {
+             sh 'echo "nexus.cloud.vssi.com:8083/${DOCKER_REPO}:${BUILD_NUMBER} " > anchore_images '
+
+              anchore bailOnFail: false, bailOnPluginFail: false, name: 'anchore_images'
+
+          }
+        }
+      }//stage
+
+
+
+
+    } // stages
+} // pipeline
